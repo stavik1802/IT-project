@@ -1,14 +1,16 @@
 import os
 import json
 import re
-from typing import List, Tuple
+from datetime import datetime
+from typing import List, Tuple, Optional
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 from openai import OpenAI
+from pydantic import BaseModel
 
 # ----------------------------
 # Load environment + clients
@@ -18,13 +20,21 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "real_estate_db")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing from .env")
 if not PERPLEXITY_API_KEY:
     raise RuntimeError("PERPLEXITY_API_KEY is missing from .env")
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI is missing from .env")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+mongo_client = AsyncIOMotorClient(MONGO_URI)
+mongo_db = mongo_client[MONGO_DB_NAME]
+search_logs_collection = mongo_db["search_logs"]
 
 
 # ----------------------------
@@ -48,7 +58,7 @@ class PropertyResult(BaseModel):
     sqft: float
     estimatedRent: float
     grossYield: float  # e.g. 0.08 = 8%
-    url: str           # direct link to listing (may be empty)
+    url: str = ""      # direct link to listing (may be empty)
 
 
 class EvaluationResponse(BaseModel):
@@ -62,6 +72,20 @@ class RentOnlyResponse(BaseModel):
     currency: str = "USD"
 
 
+class EvaluateWithRentRequest(BaseModel):
+    params: SearchParams
+    averageRent: float
+
+
+class HistoryLog(BaseModel):
+    id: str
+    createdAt: datetime
+    params: SearchParams
+    averageRent: float
+    propertiesCount: int
+    bestYield: Optional[float] = None
+
+
 # ----------------------------
 # FastAPI + CORS
 # ----------------------------
@@ -73,6 +97,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        # add your deployed frontend URL(s) here:
+        # "https://your-frontend-domain.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -107,8 +133,7 @@ def strip_markdown_fences(text: str) -> str:
 
 def _safe_float(x):
     """
-    Convert x to float, being tolerant of things like:
-    "$450,000", "900 sq ft", "3,200", "450k", etc.
+    Convert x to float, tolerant of "$450,000", "900 sq ft", "3,200", etc.
     """
     if isinstance(x, (int, float)):
         return float(x)
@@ -122,8 +147,7 @@ def _safe_float(x):
 
 def _safe_int(x):
     """
-    Convert x to int, being tolerant of things like:
-    "2 bd", "3 beds", "4.0", etc.
+    Convert x to int, tolerant of "2 bd", "3 beds", "4.0", etc.
     """
     if isinstance(x, int):
         return x
@@ -135,6 +159,53 @@ def _safe_int(x):
             raise ValueError(f"Cannot parse int from: {x!r}")
         return int(m.group(0))
     raise TypeError(f"Unexpected type for int: {type(x)}")
+
+
+def _safe_url_from_property(p: dict) -> str:
+    """
+    Try to extract a URL from various possible keys that the model might use.
+    Prefer strings starting with http(s).
+    """
+    url_keys = ["url", "link", "listing_url", "website", "listing", "details_url"]
+
+    for key in url_keys:
+        v = p.get(key)
+        if isinstance(v, str) and v.strip().startswith("http"):
+            return v.strip()
+
+    # fallback: any string value containing http
+    for v in p.values():
+        if isinstance(v, str) and "http" in v:
+            m = re.search(r"https?://[^\s)]+", v)
+            if m:
+                return m.group(0)
+
+    return ""
+
+
+async def save_search_log(
+    params: SearchParams,
+    average_rent: float,
+    properties: List[PropertyResult],
+) -> None:
+    """
+    Store the query + response summary in MongoDB.
+    """
+    best_yield = None
+    if properties:
+        best_yield = max(p.grossYield for p in properties)
+
+    doc = {
+        "createdAt": datetime.utcnow(),
+        "params": params.model_dump(),
+        "averageRent": float(average_rent),
+        "propertiesCount": len(properties),
+        "bestYield": float(best_yield) if best_yield is not None else None,
+        # If you want full properties stored, uncomment the next line:
+        # "properties": [p.model_dump() for p in properties],
+    }
+
+    await search_logs_collection.insert_one(doc)
 
 
 # ===============================
@@ -351,7 +422,6 @@ Formatting rules:
     return content
 
 
-
 # ===============================
 # 2 & 4) OpenAI: parse listings + compute yields
 # ===============================
@@ -399,8 +469,9 @@ Rules:
 - Do NOT add extra top-level keys.
 - "properties" should be an array of listing objects.
 - Numbers must be plain numbers (no commas, no currency symbols).
-- If a URL is not clearly present, set "url" to "".
-- If square footage is not clearly present, estimate a reasonable number and use that.
+- If you see a URL anywhere in the listing line (even in parentheses),
+  you MUST copy that exact URL string into the "url" field.
+- If no URL is present at all, set "url" to "".
 """.strip()
 
     user_prompt = f"""
@@ -450,7 +521,7 @@ Remember:
 
         content = completion.choices[0].message.content
 
-        # Optional debug
+        # Debug
         print("\n=== RAW OPENAI JSON RESPONSE ===")
         print(content)
         print("================================\n")
@@ -482,7 +553,7 @@ Remember:
                 )
                 address = str(p.get("address", "Unknown address"))
                 pid = str(p.get("id", f"prop-{i}"))
-                url = str(p.get("url", ""))
+                url = _safe_url_from_property(p)
 
                 if price <= 0 or est_rent <= 0:
                     raise ValueError("Non-positive price or rent")
@@ -532,13 +603,11 @@ async def call_perplexity_investment_agent(
     High-level pipeline:
 
     1. Get average rent from Perplexity (live rental sites).
-    2. Parse that JSON (no extra LLM).
-    3. Get sale listings text from Perplexity (live sale sites).
-    4. Use OpenAI to parse listings (price/address/bedrooms/sqft/url).
-       For each listing, use the avg rent from step 1 as estimatedRent and compute yield.
+    2. Get sale listings text from Perplexity (live sale sites).
+    3. Use OpenAI to parse listings (price/address/bedrooms/sqft/url),
+       using that avg rent as the per-listing rent + computing yields.
 
-    Returns:
-        (average_rent_usd, [PropertyResult, ...])
+    This is still used by /api/evaluate (mainly for debugging / testing).
     """
     avg_rent = await fetch_average_rent_from_perplexity(params)
     raw_listings_text = await fetch_listings_from_perplexity(params)
@@ -554,7 +623,7 @@ async def call_perplexity_investment_agent(
 async def estimate_rent(params: SearchParams):
     """
     Returns only the average monthly rent estimate from Perplexity.
-    Used by the frontend to show the rent quickly before full evaluation.
+    Used by the frontend to show the rent quickly.
     """
     avg_rent = await fetch_average_rent_from_perplexity(params)
     return RentOnlyResponse(averageRent=avg_rent, currency="USD")
@@ -563,14 +632,83 @@ async def estimate_rent(params: SearchParams):
 @app.post("/api/evaluate", response_model=EvaluationResponse)
 async def evaluate_investment(params: SearchParams):
     """
-    Frontend entrypoint: runs the full investment pipeline.
+    Full pipeline in one shot (calls Perplexity for rent AND listings).
+    Mostly useful for debugging and tests.
     """
     avg_rent, properties = await call_perplexity_investment_agent(params)
 
     properties_sorted = sorted(properties, key=lambda p: p.grossYield, reverse=True)
+
+    # Log to Mongo
+    await save_search_log(params, avg_rent, properties_sorted)
 
     return EvaluationResponse(
         averageRent=avg_rent,
         currency="USD",
         properties=properties_sorted,
     )
+
+
+@app.post("/api/evaluate-with-rent", response_model=EvaluationResponse)
+async def evaluate_investment_with_rent(payload: EvaluateWithRentRequest):
+    """
+    Variant of evaluation that reuses the averageRent already computed
+    in the first Perplexity call (from /api/estimate-rent).
+
+    It does NOT call fetch_average_rent_from_perplexity again.
+    It only:
+      - Fetches listings from Perplexity
+      - Parses them with OpenAI using the provided averageRent as the rent hint
+      - Computes yields using that same averageRent
+    """
+    params = payload.params
+    avg_rent = float(payload.averageRent)
+
+    if avg_rent <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="averageRent must be positive in evaluate-with-rent payload.",
+        )
+
+    raw_listings_text = await fetch_listings_from_perplexity(params)
+    properties = parse_listings_with_openai(raw_listings_text, avg_rent, params)
+
+    properties_sorted = sorted(properties, key=lambda p: p.grossYield, reverse=True)
+
+    # Log to Mongo
+    await save_search_log(params, avg_rent, properties_sorted)
+
+    return EvaluationResponse(
+        averageRent=avg_rent,
+        currency="USD",
+        properties=properties_sorted,
+    )
+
+
+@app.get("/api/history", response_model=List[HistoryLog])
+async def get_history(limit: int = 10):
+    """
+    Return the most recent evaluation queries + summary,
+    for showing on the front page or debugging.
+    """
+    cursor = (
+        search_logs_collection
+        .find({})
+        .sort("createdAt", -1)
+        .limit(limit)
+    )
+
+    items: List[HistoryLog] = []
+    async for doc in cursor:
+        items.append(
+            HistoryLog(
+                id=str(doc["_id"]),
+                createdAt=doc["createdAt"],
+                params=SearchParams(**doc["params"]),
+                averageRent=doc["averageRent"],
+                propertiesCount=doc.get("propertiesCount", 0),
+                bestYield=doc.get("bestYield"),
+            )
+        )
+
+    return items

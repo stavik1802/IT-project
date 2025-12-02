@@ -6,11 +6,11 @@ import type {
   SearchParams,
   PropertyResult,
 } from "../types";
-import { evaluateInvestment } from "../api";
+import { evaluateInvestmentWithRent } from "../api";
 
 interface LocationState {
   searchParams: SearchParams;
-  initialAverageRent: number;
+  initialAverageRent: number; // from /api/estimate-rent
 }
 
 function ResultsPage() {
@@ -40,7 +40,7 @@ function ResultsPage() {
     );
   }
 
-  const { searchParams } = state;
+  const { searchParams, initialAverageRent } = state;
 
   useEffect(() => {
     let isCancelled = false;
@@ -50,13 +50,16 @@ function ResultsPage() {
         setIsPropertiesLoading(true);
         setError(null);
 
-        const fullResult: EvaluationResponse = await evaluateInvestment(
-          searchParams
+        // 🔹 Use the same averageRent we got in the first call
+        const fullResult: EvaluationResponse = await evaluateInvestmentWithRent(
+          searchParams,
+          initialAverageRent
         );
 
         if (isCancelled) return;
 
         setProperties(fullResult.properties || []);
+        // This should equal initialAverageRent, but we set it anyway for safety
         setAverageRent(fullResult.averageRent);
       } catch (err: any) {
         console.error(err);
@@ -78,7 +81,7 @@ function ResultsPage() {
     return () => {
       isCancelled = true;
     };
-  }, [searchParams]);
+  }, [searchParams, initialAverageRent]);
 
   const bestProperty =
     properties.length > 0
@@ -96,7 +99,7 @@ function ResultsPage() {
         </h1>
         <p className="card-subtitle">
           Average rent appears first. Sample properties and yields load
-          afterwards.
+          afterwards, using that same rent.
         </p>
       </header>
 

@@ -1,8 +1,8 @@
 // src/pages/InputPage.tsx
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import type { SearchParams } from "../types";
-import { estimateRent } from "../api";
+import type { SearchParams, SearchLog } from "../types";
+import { estimateRent, getHistory } from "../api";
 
 const defaultValues: SearchParams = {
   minPrice: 200000,
@@ -17,6 +17,10 @@ function InputPage() {
   const [form, setForm] = useState<SearchParams>(defaultValues);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+
+  const [history, setHistory] = useState<SearchLog[]>([]);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   const navigate = useNavigate();
 
@@ -57,10 +61,10 @@ function InputPage() {
     try {
       setIsLoading(true);
 
-      // 1️⃣ First: get average rent quickly
+      // 🔹 First step: only get the averageRent
       const rentResult = await estimateRent(form);
 
-      // 2️⃣ Navigate to results, passing search + avg rent
+      // Pass parameters + initialAverageRent to results page
       navigate("/results", {
         state: {
           searchParams: form,
@@ -77,6 +81,32 @@ function InputPage() {
     }
   }
 
+  // 🔹 Load recent history on first page
+  useEffect(() => {
+    async function loadHistory() {
+      try {
+        setHistoryLoading(true);
+        setHistoryError(null);
+        const items = await getHistory(5);
+        setHistory(items);
+      } catch (err: any) {
+        console.error("Failed to load history", err);
+        setHistoryError(
+          err?.message || "Failed to load recent evaluations."
+        );
+      } finally {
+        setHistoryLoading(false);
+      }
+    }
+
+    loadHistory();
+  }, []);
+
+  // Optional: click a history item to refill form quickly
+  function applyFromHistory(h: SearchLog) {
+    setForm(h.params);
+  }
+
   return (
     <div className="card">
       <header className="card-header">
@@ -88,7 +118,7 @@ function InputPage() {
 
       <div className="chip-row">
         <span className="chip">Step 1 · Input Criteria</span>
-        <span className="chip">Step 2 · View Rent & Properties</span>
+        <span className="chip">Step 2 · View Rent & Yields</span>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-4">
@@ -194,6 +224,59 @@ function InputPage() {
           {isLoading ? "Contacting rent agent..." : "Get Rent Estimate"}
         </button>
       </form>
+
+      {/* 🔹 Recent evaluations section */}
+      <div style={{ marginTop: 32 }}>
+        <h2 className="card-title" style={{ fontSize: 18 }}>
+          Recent evaluations
+        </h2>
+
+        {historyLoading && <p>Loading recent evaluations…</p>}
+        {historyError && <div className="error-box">{historyError}</div>}
+
+        {!historyLoading && !historyError && history.length === 0 && (
+          <p className="card-subtitle">No previous searches yet.</p>
+        )}
+
+        {history.length > 0 && (
+          <div className="results-tags" style={{ marginTop: 8 }}>
+            {history.map((h) => (
+              <div
+                key={h.id}
+                style={{
+                  marginBottom: 10,
+                  padding: 8,
+                  borderRadius: 8,
+                  border: "1px solid rgba(0,0,0,0.08)",
+                  cursor: "pointer",
+                }}
+                onClick={() => applyFromHistory(h)}
+                title="Click to reuse these criteria"
+              >
+                <div>
+                  <strong>{h.params.area}</strong> ·{" "}
+                  {h.params.bedrooms}br ·{" "}
+                  {h.params.minPrice.toLocaleString()}–
+                  {h.params.maxPrice.toLocaleString()} USD
+                </div>
+                <div>
+                  Avg rent: ${h.averageRent.toLocaleString()} · Properties:{" "}
+                  {h.propertiesCount}
+                  {h.bestYield != null && (
+                    <>
+                      {" "}
+                      · Best yield: {(h.bestYield * 100).toFixed(2)}%
+                    </>
+                  )}
+                </div>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  {new Date(h.createdAt).toLocaleString()}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

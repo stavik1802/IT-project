@@ -16,8 +16,8 @@ export interface PropertyResult {
   bedrooms: number;
   sqft: number;
   estimatedRent: number;
-  grossYield: number; // 0.08 = 8%
-  url: string;        // direct link to listing (may be empty)
+  grossYield: number;
+  url?: string;
 }
 
 export interface EvaluationResponse {
@@ -29,4 +29,13 @@ export interface EvaluationResponse {
 export interface RentOnlyResponse {
   averageRent: number;
   currency: string;
+}
+
+export interface SearchLog {
+  id: string;
+  createdAt: string; // ISO string from backend
+  params: SearchParams;
+  averageRent: number;
+  propertiesCount: number;
+  bestYield?: number | null;
 }
