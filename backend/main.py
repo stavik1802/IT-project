@@ -22,6 +22,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "real_estate_db")
+print("EB STARTUP: MONGO_URI =", os.getenv("MONGO_URI"))
+
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing from .env")
