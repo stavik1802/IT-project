@@ -1,5 +1,6 @@
 // src/pages/InputPage.tsx
-import { FormEvent, useEffect, useState } from "react";
+import type { FormEvent, ChangeEvent } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { SearchParams, SearchLog } from "../types";
 import { estimateRent, getHistory } from "../api";
@@ -25,7 +26,7 @@ function InputPage() {
   const navigate = useNavigate();
 
   function handleChange(
-    e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
+    e: ChangeEvent<HTMLInputElement | HTMLSelectElement>
   ) {
     const { name, value } = e.target;
     setForm((prev) => ({
@@ -33,6 +34,7 @@ function InputPage() {
       [name]: name === "area" ? value : Number(value),
     }));
   }
+  
 
   function validateForm(): string | null {
     if (!form.area.trim()) return "Area is required.";
